@@ -1,13 +1,19 @@
 # sync-youtube-downloads
 
-Copy YouTube channel lines between list files, adding yt-dlp option profiles
+Copies channel lines (`URL # name`, the format written by
+export-youtube-subscriptions) from one file to the end of another. Lines whose URL the
+destination already has are skipped. You can pass a profile name to insert a
+yt-dlp option string between the URL and the comment.
 
-## Status
-Tracked in this repo's issues and milestones. See the team workflow: labels `type/*`, `priority/*`, `status/*`, `area/*`.
+```sh
+cp sync-youtube-downloads.example.env sync-youtube-downloads.env
+./sync-youtube-downloads ~/notes/pages/musicians.md channels.txt music-videos
+# https://www.youtube.com/channel/UC... | --no-match-filters --match-filter ... # ODESZA
 
-## Development
-- `make ci` runs everything CI runs (lint, test, build). Add it before the first feature lands.
-- Config: copy `sync-youtube-downloads.example.env` to `sync-youtube-downloads.env` (git-ignored).
+./sync-youtube-downloads ~/notes/pages/youtubers.md channels.txt   # no profile: URL # name
+./sync-youtube-downloads --dry-run SRC DEST music-videos           # preview
+```
 
-## Operations
-<!-- How to run, deploy, observe, roll back. -->
+Profiles live in the env file as `PROFILE_<NAME>=<string>` (`music-videos` maps to
+`PROFILE_MUSIC_VIDEOS`). The value is taken literally. See `--help` for
+the env file lookup order, matching rules and exit codes. Run the tests with `make ci`.

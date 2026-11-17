@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# sync-youtube-downloads: append channel lines from one list file to another,
+# skipping URLs the destination already has, optionally inserting a yt-dlp
+# option string (a "profile" from the env file) between URL and comment.
+set -euo pipefail
+
+ProgName=$(basename "$0")
+
+usage() {
+  cat <<EOF
+Usage: $ProgName [options] SOURCE DESTINATION [PROFILE]
+
+Copy every channel line (URL plus optional "# comment") from SOURCE to the end
+of DESTINATION, unless DESTINATION already contains that URL.
+
+If PROFILE is given (e.g. music-videos), the string stored in the env file
+under PROFILE_<NAME> (here PROFILE_MUSIC_VIDEOS) is inserted between the URL
+and the comment:
+
+  URL <profile string> # comment
+
+Without PROFILE nothing is inserted:  URL # comment
+
+Arguments:
+  SOURCE        File to read channel lines from (e.g. ~/notes/pages/musicians.md)
+  DESTINATION   File to append to. Created if missing.
+  PROFILE       Optional profile name. Dashes become underscores, case is ignored.
+
+Options:
+  -n, --dry-run        Print the lines that would be appended; change nothing
+  -e, --env-file PATH  Env file to read (must exist)
+  -h, --help           Show this help
+
+Env file lookup (first match wins):
+  1. --env-file PATH
+  2. \$SYD_ENV_FILE
+  3. sync-youtube-downloads.env next to this script (symlinks resolved)
+  4. \${XDG_CONFIG_HOME:-~/.config}/sync-youtube-downloads/sync-youtube-downloads.env
+
+Env file syntax: PROFILE_<NAME>=<value>. The value is everything after the
+first '=', taken literally (no quote removal, no expansion), so it can hold
+both quote types. Blank lines and lines starting with '#' are ignored.
+
+What counts as a channel line: the first word starts with http:// or https://
+(an optional "- " bullet is dropped). Headers, blank lines and notes are
+skipped. URLs are compared exactly, ignoring a trailing '/'.
+
+Exit codes: 0 success, 1 file error, 2 usage or config error.
+EOF
+}
+
+die() { echo "$ProgName: error: $1" >&2; exit "${2:-2}"; }
+
+# Resolve symlinks to find the real script directory (macOS has no readlink -f).
+script_dir() {
+  local path="$0" link
+  while [ -L "$path" ]; do
+    link=$(readlink "$path")
+    case "$link" in
+      /*) path="$link" ;;
+      *) path="$(dirname "$path")/$link" ;;
+    esac
+  done
+  cd "$(dirname "$path")" && pwd
+}
+
+dry_run=0
+env_file=""
+positional=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) dry_run=1 ;;
+    -e|--env-file)
+      [ $# -ge 2 ] || die "$1 needs a path"
+      env_file="$2"; shift ;;
+    --env-file=*) env_file="${1#*=}" ;;
+    --) shift; positional+=("$@"); break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) positional+=("$1") ;;
+  esac
+  shift
+done
+
+if [ ${#positional[@]} -lt 2 ] || [ ${#positional[@]} -gt 3 ]; then
+  usage >&2
+  exit 2
+fi
+source_file="${positional[0]}"
+dest_file="${positional[1]}"
+profile="${positional[2]:-}"
+
+[ -f "$source_file" ] || die "source file not found: $source_file" 1
+[ -r "$source_file" ] || die "source file not readable: $source_file" 1
+if [ -e "$dest_file" ] && [ ! -f "$dest_file" ]; then
+  die "destination is not a regular file: $dest_file" 1
+fi
+
+profile_string=""
+if [ -n "$profile" ]; then
+  # Locate the env file.
+  if [ -z "$env_file" ] && [ -n "${SYD_ENV_FILE:-}" ]; then
+    env_file="$SYD_ENV_FILE"
+  fi
+  if [ -n "$env_file" ]; then
+    [ -f "$env_file" ] || die "env file not found: $env_file"
+  else
+    for candidate in \
+      "$(script_dir)/sync-youtube-downloads.env" \
+      "${XDG_CONFIG_HOME:-$HOME/.config}/sync-youtube-downloads/sync-youtube-downloads.env"; do
+      if [ -f "$candidate" ]; then env_file="$candidate"; break; fi
+    done
+    [ -n "$env_file" ] || die "profile '$profile' given but no env file found (see --help)"
+  fi
+
+  key="PROFILE_$(printf '%s' "$profile" | tr 'a-z-' 'A-Z_')"
+  case "$key" in
+    *[!A-Z0-9_]*) die "invalid profile name: $profile" ;;
+  esac
+
+  # Last occurrence wins. Read literally: no sourcing, no quote handling.
+  found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      "$key="*) profile_string="${line#*=}"; found=1 ;;
+      "export $key="*) profile_string="${line#*=}"; found=1 ;;
+    esac
+  done < "$env_file"
+
+  if [ "$found" -ne 1 ]; then
+    available=$(sed -n -E 's/^(export )?PROFILE_([A-Z0-9_]+)=.*/\2/p' "$env_file" \
+      | tr 'A-Z_' 'a-z-' | sort -u | paste -sd ' ' -)
+    die "unknown profile '$profile' (no $key in $env_file). Available: ${available:-none}"
+  fi
+  [ -n "$profile_string" ] || die "$key is empty in $env_file"
+fi
+
+[ -e "$dest_file" ] || dest_missing=1
+dest_for_read="$dest_file"
+[ -e "$dest_file" ] || dest_for_read=/dev/null
+
+# Build the lines to append. The profile string goes through ENVIRON, not -v,
+# so awk doesn't interpret backslashes in it.
+new_lines=$(SYD_PROFILE_STRING="$profile_string" awk '
+  function url_key(u) { sub(/\/+$/, "", u); return u }
+  function first_url(line,   f) {
+    sub(/^[ \t]*-[ \t]+/, "", line)
+    sub(/^[ \t]+/, "", line)
+    split(line, f, /[ \t]+/)
+    return (f[1] ~ /^https?:\/\//) ? f[1] : ""
+  }
+  BEGIN { insert = ENVIRON["SYD_PROFILE_STRING"] }
+  phase == "dest" {                           # destination: collect URLs
+    sub(/\r$/, "")
+    u = first_url($0)
+    if (u != "") seen[url_key(u)] = 1
+    next
+  }
+  {                                            # source: emit new lines
+    sub(/\r$/, "")
+    line = $0
+    sub(/^[ \t]*-[ \t]+/, "", line)
+    sub(/^[ \t]+/, "", line)
+    u = first_url(line)
+    if (u == "" || (url_key(u) in seen)) next
+    seen[url_key(u)] = 1
+    rest = substr(line, length(u) + 1)
+    comment = ""
+    if (match(rest, /#/)) comment = substr(rest, RSTART)
+    sub(/[ \t]+$/, "", comment)
+    out = u
+    if (insert != "") out = out " " insert
+    if (comment != "") out = out " " comment
+    print out
+  }
+' phase=dest "$dest_for_read" phase=source "$source_file")
+
+if [ -z "$new_lines" ]; then
+  count=0
+else
+  count=$(printf '%s\n' "$new_lines" | wc -l | tr -d ' ')
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+  [ "$count" -gt 0 ] && printf '%s\n' "$new_lines"
+  echo "dry run: would append $count line(s) to $dest_file" >&2
+  exit 0
+fi
+
+if [ "$count" -gt 0 ]; then
+  # Make sure the existing file ends with a newline before appending.
+  if [ -z "${dest_missing:-}" ] && [ -s "$dest_file" ] \
+     && [ "$(tail -c 1 "$dest_file" | od -An -c | tr -d ' ')" != '\n' ]; then
+    printf '\n' >> "$dest_file" || die "cannot write $dest_file" 1
+  fi
+  printf '%s\n' "$new_lines" >> "$dest_file" || die "cannot write $dest_file" 1
+fi
+echo "appended $count line(s) to $dest_file" >&2

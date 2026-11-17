@@ -1,0 +1,22 @@
+# CI skeleton. Runs on the instance runner (label: docker -> node:22-bookworm).
+# Replace the "ci" step with the project's real lint/test/build.
+# Convention: if a Makefile with a `ci` target exists, CI runs `make ci`.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: docker
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: ci
+        run: |
+          if [ -f Makefile ] && grep -qE '^ci:' Makefile; then
+            make ci
+          else
+            echo "No 'make ci' target yet; add one to run real checks."
+          fi

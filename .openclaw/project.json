@@ -1,5 +1,5 @@
 {
-  "dispatch": false,
-  "escalationChannel": "",
+  "dispatch": true,
+  "escalationChannel": "channel:1571643397922488473",
   "autonomy": "pr"
 }
